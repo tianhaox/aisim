@@ -1240,6 +1240,7 @@ class AttentionBackend(StrEnum):
     """Supported attention performance-model backends."""
 
     fa3 = "fa3"
+    fa4 = "fa4"
     triton = "triton"
     trtllm_mha = "trtllm_mha"
     flashinfer = "flashinfer"
@@ -1318,9 +1319,12 @@ class PerfDataFilename(Enum):
     #     queried by ``_lookup_sparse_kernel``). The csa_attn / hca_attn FMLA
     #     sidecars were removed 2026-10-15 (retired placeholders, no query path).
     #   csa_topk_calib : top-k kernel rows per shape (score_mode flat and/or
-    #     top_last). A shape with both forms the topK DELTA (flat-top_last)
-    #     correction applied to CSA module latency; a release with only
-    #     top_last rows forms none. Context-parallel prefill reads top_last.
+    #     top_last). A release with flat rows timed its CSA module on
+    #     degenerate scores: its flat and top_last rows form the topK DELTA
+    #     (flat-top_last) and its module rows are corrected by it. A release
+    #     with only top_last rows forms no DELTA and its module rows stay as
+    #     measured, also when rows of an earlier release fill the same table.
+    #     Context-parallel prefill reads top_last.
     dsv4_paged_mqa_logits_module = "dsv4_paged_mqa_logits_module_perf.parquet"
     dsv4_csa_topk_calib = "dsv4_csa_topk_calib_perf.parquet"
     dsv4_megamoe_module = "dsv4_megamoe_module_perf.parquet"
