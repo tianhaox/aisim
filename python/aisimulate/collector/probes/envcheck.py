@@ -69,6 +69,20 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     repos = [r for r in args.get("repo", "").split("+") if r]
     mib = int(args.get("mib", "512"))
     result: dict = {}
+    if args.get("fill"):
+        # does a large file beside the result directory break the pipeline's result snapshots?
+        target = Path(args.get("where", "/mnt/ci_job")) / "envcheck-fill.bin"
+        chunk = b"\0" * (64 << 20)
+        started = time.time()
+        with target.open("wb") as stream:
+            for _ in range(int(args["fill"]) * 16):
+                stream.write(chunk)
+        result["fill"] = {"path": str(target), "gib": int(args["fill"]), "seconds": round(time.time() - started, 1)}
+        (out_dir / "fill_marker_before_wait.txt").write_text(json.dumps(result["fill"]))
+        time.sleep(int(args.get("wait", "240")))
+        (out_dir / "fill_marker_after_wait.txt").write_text("done")
+        print("ENVCHECK_FILL " + json.dumps(result["fill"]), flush=True)
+        return result
     result["disk"] = {
         p: _try(lambda p=p: {k: round(v / (1 << 30), 1) for k, v in shutil.disk_usage(p)._asdict().items()})
         for p in ("/mnt/ci_job", "/tmp", "/dev/shm", str(Path.cwd()), "/root")
