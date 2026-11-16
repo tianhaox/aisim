@@ -160,3 +160,26 @@ def test_a_staged_checkpoint_is_used_only_with_the_pinned_config(tmp_path, monke
 def test_the_kv_identity_follows_the_sm():
     assert glm.serving_kv_cache_dtype(90) == "bfloat16"
     assert glm.serving_kv_cache_dtype(100) == glm.serving_kv_cache_dtype(103) == "fp8"
+
+
+def test_an_attempt_the_job_stopped_reopens_its_set_at_the_same_utilization(tmp_path, monkeypatch):
+    """A window that ends mid-attempt leaves no receipt and no failed set. The set in flight is
+    named as interrupted, which keeps the attempt admissible and does not count as a failure of
+    that utilization."""
+    monkeypatch.setattr(glm, "class_sets", lambda context_class: ["decode-b3", "decode-b6"])
+    stopped = _freeze(tmp_path, "nvfp4-tp2-regular-00-u85", ["decode-b3", "decode-b6"], 0.85)
+    _record(stopped, ["decode-b3"])
+    remaining, failures = glm.open_sets(tmp_path, "nvfp4", 2, "regular")
+    assert remaining == ["decode-b6"] and failures == {}
+    state = glm.attempt_state(stopped)
+    assert state["failed"]["decode-b6"].startswith(glm.INTERRUPTED) and state["done"] == ["decode-b3"]
+    # closing is idempotent
+    assert glm.close_attempt(stopped, glm.INTERRUPTED, "again") is None
+
+
+def test_a_runner_that_dies_before_naming_a_set_counts_against_that_utilization(tmp_path):
+    attempt = _freeze(tmp_path, "nvfp4-tp2-regular-00-u92", ["decode-b3", "decode-b6"], 0.92)
+    assert glm.close_attempt(attempt, "RunnerExit", "exit code 1") == "decode-b3"
+    (attempt / "attempt_state.json").write_text("{}")
+    remaining, failures = glm.open_sets(tmp_path, "nvfp4", 2, "regular")
+    assert "decode-b3" in remaining and list(failures["decode-b3"]) == ["0.92"]
