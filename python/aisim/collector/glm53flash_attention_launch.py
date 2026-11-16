@@ -123,7 +123,13 @@ def serving_env(backend: str, spec: dict) -> dict:
     return {**VLLM_ENV, **(VLLM_NVL72_ENV if spec["multi_node_nvlink"] else {})}
 
 
-def prepare(args) -> Path:
+def freeze(args) -> tuple[Path, dict, dict]:
+    """Write ``manifest.json`` of one attempt into a fresh ``args.attempt`` directory.
+
+    Returns the attempt directory, the manifest and the serving environment. ``prepare``
+    adds the Slurm script; the pipeline collector (``collector/vllm/collect_glm53_attention``)
+    runs the runner on the frozen manifest itself.
+    """
     import yaml
 
     spec = system_spec(args.system, args.systems_dir)
@@ -150,7 +156,7 @@ def prepare(args) -> Path:
     if args.backend == "vllm":
         bad = unaligned_targets({"sets": selected})
         if bad:
-            # Stock vLLM 0.31.0 must never run an unaligned chunk start.
+            # Stock vLLM 0.32.0 must never run an unaligned chunk start.
             raise SystemExit(f"kpool_align4: vLLM plan has unaligned prefill targets {bad[:6]}")
     max_model_len = selected[0]["max_model_len"]
     env_serving = serving_env(args.backend, spec)
@@ -199,6 +205,12 @@ def prepare(args) -> Path:
     attempt.mkdir(parents=True, exist_ok=True)
     manifest = {**body, "manifest_sha256": sha256_json(body)}
     (attempt / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return attempt, manifest, env_serving
+
+
+def prepare(args) -> Path:
+    attempt, manifest, env_serving = freeze(args)
+    max_model_len = manifest["max_model_len"]
     suffix = f"-{args.tag}" if args.tag else ""
     job = f"glm53-attn-{args.backend}-{args.checkpoint}-tp{args.tp}{suffix}"
     container = f"{args.remote_attempt}"
