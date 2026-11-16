@@ -32,6 +32,22 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     print("GLM53_FETCH " + json.dumps(result), flush=True)
     if args.get("fetch") == "0":
         return result
+    if args.get("mode") == "deploy":
+        # every open set of the class, in passes over the utilization ladder
+        with glm.exclusive(Path(out_dir)):
+            summary = glm.run_deployment(
+                output=Path(out_dir),
+                system=system,
+                checkpoint=checkpoint,
+                tp_size=tp_size,
+                kv_cache_dtype=kv,
+                context_class=context_class,
+                model_path=model_path,
+            )
+        result["deployment"] = summary
+        result["failed"] = bool(summary["open_sets"])
+        print("GLM53_DEPLOY_BEGIN " + json.dumps(result, default=str) + " GLM53_DEPLOY_END", flush=True)
+        return result
     name = f"{checkpoint}-tp{tp_size}-{context_class}-probe-u{int(float(args.get('util', '0.85')) * 100)}"
     with glm.exclusive(Path(out_dir)):
         state = glm.run_attempt(

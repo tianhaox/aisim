@@ -159,6 +159,27 @@ def attempt_state(attempt: Path) -> dict:
     }
 
 
+INTERRUPTED = "Interrupted"
+
+
+def close_attempt(attempt: Path, error_type: str, error: str) -> str | None:
+    """Name the set an attempt was measuring when it ended without a completion receipt and
+    without a failed set, so ``finalize --partial`` can admit what it finished. Returns the set."""
+    state = attempt_state(attempt)
+    if state["complete"] or state["failed"]:
+        return None
+    manifest = json.loads((attempt / "manifest.json").read_text())
+    order = [s["set_id"] for s in manifest["plan"]["sets"] if s["set_id"] in set(state["selected"])]
+    in_flight = next((s for s in order if s not in state["done"]), None)
+    if in_flight is None:
+        return None
+    (attempt / "raw").mkdir(exist_ok=True)
+    with (attempt / "raw" / "progress.jsonl").open("a") as stream:
+        entry = {"set_id": in_flight, "status": "failed", "error_type": error_type, "error": error}
+        stream.write(json.dumps(entry) + "\n")
+    return in_flight
+
+
 def run_attempt(
     *,
     output: Path,
@@ -227,6 +248,12 @@ def run_attempt(
             code = subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout).returncode
         except subprocess.TimeoutExpired:
             code = None
+    if code != 0:
+        # the runner names the failing set itself; when it dies earlier (engine start) or is
+        # stopped, the set in flight is recorded here
+        close_attempt(
+            attempt, "RunnerExit", f"the runner ended with exit code {code} before naming a set; see runner.log"
+        )
     state = attempt_state(attempt)
     state.update(returncode=code, seconds=round(time.time() - started, 1))
     (attempt / "attempt_state.json").write_text(json.dumps(state, indent=1))
@@ -240,10 +267,15 @@ def open_sets(output: Path, checkpoint: str, tp_size: int, context_class: str) -
     failures: dict[str, dict[str, str]] = {}
     prefix = f"{checkpoint}-tp{tp_size}-{context_class}-"
     for attempt in sorted(p for p in output.glob(f"{prefix}*") if (p / "manifest.json").is_file()):
+        if not (attempt / "attempt_state.json").is_file():
+            # the job was stopped while this attempt ran (the caller holds the GPU lock, so it
+            # is not running now): its set in flight is open again at the same utilization
+            close_attempt(attempt, INTERRUPTED, "the job ended while this attempt was running")
         state = attempt_state(attempt)
         done.update(state["done"])
         for set_id, error in state["failed"].items():
-            failures.setdefault(set_id, {})[str(state["utilization"])] = error
+            if not error.startswith(INTERRUPTED):
+                failures.setdefault(set_id, {})[str(state["utilization"])] = error
     return [s for s in class_sets(context_class) if s not in done], failures
 
 
@@ -291,7 +323,7 @@ def run_deployment(
         passes.append({k: state[k] for k in ("attempt", "complete", "utilization", "returncode", "seconds")})
         passes[-1].update(done=len(state["done"]), failed=state["failed"])
         if not state["done"] and not state["failed"]:
-            # the runner died before any set finished and named no set: nothing to skip next time
+            # nothing measured and no set named: stop instead of repeating the same pass
             passes[-1]["aborted"] = True
             break
     remaining, failures = open_sets(output, checkpoint, tp_size, context_class)
