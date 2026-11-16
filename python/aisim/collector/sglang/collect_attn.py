@@ -345,8 +345,24 @@ def check_dispatch_is_servings(attn_backend_name: str, architecture: str | None,
         )
 
 
+def _request_stride(total_len: int, page_size: int) -> int:
+    """Token slots one request owns in the KV pool: its length rounded up to whole pages.
+
+    Serving's paged allocator hands a request whole pages, so every request starts on a page
+    boundary (mem_cache/allocator/base.py, PagedTokenToKVPoolAllocator.alloc / alloc_extend:
+    "segment start ... is not page-aligned" is an assertion there). The paged backends rely
+    on it: with page_size > 1 they keep every page_size-th token id of a request, divide it
+    by page_size and read the request from offset zero of those pages
+    (layers/attention/flashattention_backend.py:1317-1330, the strided page table of FA3/FA4;
+    trtllm_mha_backend.py builds its page table the same way). A request that starts inside
+    a page would be read from another request's slots.
+    """
+    return math.ceil(total_len / page_size) * page_size
+
+
 def create_req_to_token_pool(batch_size, total_len, page_size, torch_device, device_str):
-    """Create req_to_token mapping consistent with test_flashattn_backend.py."""
+    """req_to_token for ``batch_size`` requests of ``total_len`` tokens, each on its own pages
+    after the reserved page 0 (``_request_stride``). With page_size 1 the requests are packed."""
     assert total_len > 0, "Total sequence length must be positive"
     pool = ReqToTokenPool(
         size=batch_size,
@@ -356,7 +372,7 @@ def create_req_to_token_pool(batch_size, total_len, page_size, torch_device, dev
     )
     req_indices = torch.arange(batch_size, dtype=torch.int32, device=torch_device).view(batch_size, 1)
     token_offsets = torch.arange(total_len, dtype=torch.int32, device=torch_device).view(1, total_len)
-    token_matrix = (req_indices * total_len) + token_offsets + page_size
+    token_matrix = (req_indices * _request_stride(total_len, page_size)) + token_offsets + page_size
     pool.req_to_token[:batch_size, :total_len] = token_matrix
     return pool, token_matrix.contiguous()
 
@@ -521,11 +537,8 @@ def run_attention_torch(
     )
     model_runner.req_to_token_pool = req_to_token_pool
 
-    total_tokens = batch_size * total_len
-    kv_cache_size = max(
-        model_runner.page_size,
-        math.ceil(total_tokens / model_runner.page_size) * model_runner.page_size,
-    )
+    # every request owns whole pages (_request_stride); the pool adds the reserved page 0 itself
+    kv_cache_size = max(model_runner.page_size, batch_size * _request_stride(total_len, model_runner.page_size))
     kv_pool = MHATokenToKVPool(
         size=kv_cache_size,
         page_size=model_runner.page_size,
