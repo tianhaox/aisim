@@ -525,12 +525,55 @@ def setup_sglang_distributed(world_size, rank, use_slurm):
 
     # Initialize model parallel groups
     # SGLang requires world_size == tensor_model_parallel_size * pipeline_model_parallel_size
-    sglang_mods["initialize_model_parallel"](
-        tensor_model_parallel_size=world_size,
-        pipeline_model_parallel_size=1,
-    )
+    if sglang_groups_take_widths(sglang_mods["initialize_model_parallel"]):
+        sglang_mods["initialize_model_parallel"](
+            tensor_model_parallel_size=world_size,
+            pipeline_model_parallel_size=1,
+        )
+    else:
+        # The widths come from the topology publish_sglang_server_args() published.
+        sglang_mods["initialize_model_parallel"]()
 
     return sglang_mods, local_rank
+
+
+def sglang_groups_take_widths(initialize_model_parallel) -> bool:
+    """Whether this SGLang builds its groups from call arguments (<= 0.5.20) rather than from
+    the published topology (>= 0.5.21, where initialize_model_parallel() has no width
+    parameters and reads get_parallel().tp_size / pp_size). Probed from the signature."""
+    return "tensor_model_parallel_size" in inspect.signature(initialize_model_parallel).parameters
+
+
+def publish_sglang_server_args(world_size, rank, takes_widths):
+    """Publish the process config the SGLang all-reduce path reads.
+
+    sglang >= 0.5.21 builds the groups from the published topology, so the record carries the
+    one tensor-parallel group this benchmark runs (tp_size = world size) and the launcher's
+    rank, as SGLang's own benchmark/kernels/all_reduce/benchmark_all_reduce.py does through
+    publish_build_topology(world_rank=rank, tp_size=world_size). model_path="dummy" returns
+    early from argument resolution; symmetric memory stays at the server default (off).
+    """
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    if not takes_widths:
+        from sglang.srt.runtime_context import SpawnRanks, publish
+
+        publish(
+            ServerArgs(model_path="dummy", tp_size=world_size, enable_symm_mem=False),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=rank),
+        )
+    elif hasattr(ServerArgs, "resolve_once"):
+        # SGLang 0.5.20 publishes through runtime_context, which resolves the
+        # real ServerArgs (publish -> resolve_once); a bare mock is rejected.
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", enable_symm_mem=False))
+    else:
+
+        class MockServerArgs:
+            def __init__(self):
+                self.enable_symm_mem = False
+
+        set_global_server_args_for_scheduler(MockServerArgs())
 
 
 def set_sglang_serving_all_reduce_flags(sglang_mods):
@@ -851,22 +894,9 @@ def benchmark_sglang_allreduce(
     measure_power: bool = False,
     power_min_duration: float = 1.0,
 ):
-    class MockServerArgs:
-        def __init__(self):
-            self.enable_symm_mem = False
-
-    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-
-    if hasattr(ServerArgs, "resolve_once"):
-        # SGLang 0.5.20 publishes through runtime_context, which resolves the
-        # real ServerArgs (publish -> resolve_once); a bare mock is rejected.
-        # model_path="dummy" returns early from resolution
-        # (arg_groups/pipeline.py:121); enable_symm_mem stays False.
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", enable_symm_mem=False))
-    else:
-        set_global_server_args_for_scheduler(MockServerArgs())
-
     """Benchmark SGLang custom AllReduce implementation"""
+    takes_widths = sglang_groups_take_widths(import_sglang()["initialize_model_parallel"])
+    publish_sglang_server_args(world_size, rank, takes_widths)
     sglang_mods, local_rank = setup_sglang_distributed(world_size, rank, use_slurm)
 
     # Parse test range
