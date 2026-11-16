@@ -447,7 +447,8 @@ def import_sglang():
             init_distributed_environment,
             initialize_model_parallel,
             set_custom_all_reduce,
-            set_mscclpp_all_reduce,
+            set_flashinfer_allreduce_only,
+            set_mscclpp,
             set_torch_symm_mem_all_reduce,
         )
 
@@ -458,7 +459,8 @@ def import_sglang():
             "graph_capture": graph_capture,
             "destroy_model_parallel": destroy_model_parallel,
             "set_custom_all_reduce": set_custom_all_reduce,
-            "set_mscclpp_all_reduce": set_mscclpp_all_reduce,
+            "set_flashinfer_allreduce_only": set_flashinfer_allreduce_only,
+            "set_mscclpp": set_mscclpp,
             "set_torch_symm_mem_all_reduce": set_torch_symm_mem_all_reduce,
         }
     except ImportError as e:
@@ -517,6 +519,10 @@ def setup_sglang_distributed(world_size, rank, use_slurm):
             print(f"\nERROR: Failed to initialize distributed environment: {e}")
             raise
 
+    # The groups read the all-reduce switches when they are built, so set them first, as
+    # serving does (distributed/bootstrap.py: _set_all_reduce_flags before the group setup).
+    set_sglang_serving_all_reduce_flags(sglang_mods)
+
     # Initialize model parallel groups
     # SGLang requires world_size == tensor_model_parallel_size * pipeline_model_parallel_size
     sglang_mods["initialize_model_parallel"](
@@ -524,12 +530,21 @@ def setup_sglang_distributed(world_size, rank, use_slurm):
         pipeline_model_parallel_size=1,
     )
 
-    # Enable CustomAllReduce and disable other allreduce implementations
-    sglang_mods["set_custom_all_reduce"](True)
-    sglang_mods["set_mscclpp_all_reduce"](False)
-    sglang_mods["set_torch_symm_mem_all_reduce"](False)
-
     return sglang_mods, local_rank
+
+
+def set_sglang_serving_all_reduce_flags(sglang_mods):
+    """The all-reduce switches a default SGLang server sets before it builds its groups.
+
+    sglang v0.5.23 distributed/bootstrap.py _set_all_reduce_flags: the custom all-reduce kernel
+    is on unless --disable-custom-all-reduce, MSCCL++ and torch symmetric memory are opt-in
+    (--enable-mscclpp, --enable-torch-symm-mem, both default False), and the FlashInfer
+    all-reduce-only dispatch follows --flashinfer-allreduce-fusion-backend (default unset).
+    """
+    sglang_mods["set_custom_all_reduce"](True)
+    sglang_mods["set_mscclpp"](False)
+    sglang_mods["set_torch_symm_mem_all_reduce"](False)
+    sglang_mods["set_flashinfer_allreduce_only"](False)
 
 
 def _vllm_graph_pool():
