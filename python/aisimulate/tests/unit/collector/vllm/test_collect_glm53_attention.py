@@ -209,7 +209,7 @@ def test_a_file_past_the_size_bound_leaves_the_archived_output(tmp_path, monkeyp
     assert glm.park_oversize(attempt, parking) == []
 
 
-def test_the_runner_dumps_no_core_and_runs_beside_the_output(tmp_path, monkeypatch):
+def test_the_runner_dumps_no_core_and_stray_dumps_leave_the_output(tmp_path, monkeypatch):
     """A worker that dies on a CUDA error dumps its address space into the working directory;
     in the archived output that is tens of GB a crash."""
     model = tmp_path / "model"
@@ -218,11 +218,10 @@ def test_the_runner_dumps_no_core_and_runs_beside_the_output(tmp_path, monkeypat
     output = tmp_path / "result" / "shard"
     output.mkdir(parents=True)
     monkeypatch.setattr(glm, "_job_volume", lambda: tmp_path / "volume")
-    limits, launches = [], []
+    limits = []
     monkeypatch.setattr(glm.resource, "setrlimit", lambda what, value: limits.append((what, value)))
 
     def fake_run(command, **kwargs):
-        launches.append(kwargs)
         (output / "core.VLLM::Worker_TP.1.2").write_bytes(b"x" * 200_000)  # a core pattern that names a directory
         return SimpleNamespace(returncode=1)
 
@@ -241,8 +240,6 @@ def test_the_runner_dumps_no_core_and_runs_beside_the_output(tmp_path, monkeypat
         model_path=model,
     )
     assert limits == [(glm.resource.RLIMIT_CORE, (0, 0))]
-    (launch,) = launches
-    assert output not in [launch["cwd"], *launch["cwd"].parents] and launch["cwd"].is_dir()
     assert not (output / "core.VLLM::Worker_TP.1.2").exists()
     assert (
         tmp_path / "volume" / "glm53flash-oversize" / "shard" / "core.VLLM::Worker_TP.1.2"

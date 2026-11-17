@@ -62,9 +62,8 @@ CHECKPOINT_ROOT_ENV = "GLM53_ATTN_CHECKPOINT_ROOT"
 RUNNER = "collector.vllm.glm53flash_attention_runner"
 # The output directory is archived every few minutes to a volume other jobs share. A vLLM
 # worker that dies on a CUDA error dumps core (17 GB a worker on GB200, into the working
-# directory), and the runner's log has no size bound. So the runner dumps no core and runs in
-# a directory beside the output, and a file past this size leaves the output directory; the
-# measurements are a few MB a rank.
+# directory), and the runner's log has no size bound. So the runner dumps no core, and a file
+# past this size leaves the output directory; the measurements are a few MB a rank.
 OVERSIZE_BYTES = 64 << 20
 PARK_TAIL_BYTES = 64 << 10
 
@@ -79,13 +78,6 @@ def _job_volume() -> Path:
 def checkpoint_root() -> Path:
     forced = os.environ.get(CHECKPOINT_ROOT_ENV)
     return Path(forced) if forced else _job_volume() / "glm53flash-checkpoints"
-
-
-def runner_cwd() -> Path:
-    """The runner's working directory: on the job volume, outside the archived output."""
-    cwd = _job_volume() / "glm53flash-oversize" / "cwd"
-    cwd.mkdir(parents=True, exist_ok=True)
-    return cwd
 
 
 def park_oversize(directory: Path, parking: Path | None = None) -> list[dict]:
@@ -307,7 +299,7 @@ def run_attempt(
         with (attempt / "runner.log").open("w") as log:
             try:
                 code = subprocess.run(
-                    command, env=env, cwd=runner_cwd(), stdout=log, stderr=subprocess.STDOUT, timeout=timeout
+                    command, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout
                 ).returncode
             except subprocess.TimeoutExpired:
                 code = None
