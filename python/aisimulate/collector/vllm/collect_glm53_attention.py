@@ -27,7 +27,6 @@ import fcntl
 import json
 import os
 import platform
-import resource
 import subprocess
 import sys
 import threading
@@ -298,9 +297,6 @@ def run_attempt(
         while not finished.wait(30):
             park_oversize(output)
 
-    # inherited by the runner and its workers; set here, not in a preexec hook, because the
-    # watcher thread is running when the runner is forked
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     watcher = threading.Thread(target=keep_small, daemon=True)
     watcher.start()
     try:

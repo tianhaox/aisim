@@ -218,8 +218,7 @@ def test_the_runner_dumps_no_core_and_runs_beside_the_output(tmp_path, monkeypat
     output = tmp_path / "result" / "shard"
     output.mkdir(parents=True)
     monkeypatch.setattr(glm, "_job_volume", lambda: tmp_path / "volume")
-    limits, launches = [], []
-    monkeypatch.setattr(glm.resource, "setrlimit", lambda what, value: limits.append((what, value)))
+    launches = []
 
     def fake_run(command, **kwargs):
         launches.append(kwargs)
@@ -240,7 +239,6 @@ def test_the_runner_dumps_no_core_and_runs_beside_the_output(tmp_path, monkeypat
         utilization=0.85,
         model_path=model,
     )
-    assert limits == [(glm.resource.RLIMIT_CORE, (0, 0))]
     (launch,) = launches
     assert output not in [launch["cwd"], *launch["cwd"].parents] and launch["cwd"].is_dir()
     assert not (output / "core.VLLM::Worker_TP.1.2").exists()
