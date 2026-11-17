@@ -207,3 +207,42 @@ def test_a_file_past_the_size_bound_leaves_the_archived_output(tmp_path, monkeyp
     note = json.loads((attempt / "runner.log.parked").read_text())
     assert note["tail"] == "the tail!!" and note["moved_to"] == str(parking / "runner.log")
     assert glm.park_oversize(attempt, parking) == []
+
+
+def test_the_runner_dumps_no_core_and_runs_beside_the_output(tmp_path, monkeypatch):
+    """A worker that dies on a CUDA error dumps its address space into the working directory;
+    in the archived output that is tens of GB a crash."""
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_bytes(NVFP4_CONFIG.read_bytes())
+    output = tmp_path / "result" / "shard"
+    output.mkdir(parents=True)
+    monkeypatch.setattr(glm, "_job_volume", lambda: tmp_path / "volume")
+    limits, launches = [], []
+    monkeypatch.setattr(glm.resource, "setrlimit", lambda what, value: limits.append((what, value)))
+
+    def fake_run(command, **kwargs):
+        launches.append(kwargs)
+        (output / "core.VLLM::Worker_TP.1.2").write_bytes(b"x" * 2000)  # a core pattern that names a directory
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(glm.subprocess, "run", fake_run)
+    monkeypatch.setattr(glm, "OVERSIZE_BYTES", 1000)
+    state = glm.run_attempt(
+        output=output,
+        name="nvfp4-tp2-regular-00-u85",
+        system="b300_sxm",
+        checkpoint="nvfp4",
+        tp_size=2,
+        kv_cache_dtype="fp8",
+        context_class="regular",
+        only_sets=["decode-b3"],
+        utilization=0.85,
+        model_path=model,
+    )
+    assert limits == [(glm.resource.RLIMIT_CORE, (0, 0))]
+    (launch,) = launches
+    assert output not in [launch["cwd"], *launch["cwd"].parents] and launch["cwd"].is_dir()
+    assert not (output / "core.VLLM::Worker_TP.1.2").exists()
+    assert (tmp_path / "volume" / "glm53flash-oversize" / "shard" / "core.VLLM::Worker_TP.1.2").stat().st_size == 2000
+    assert state["returncode"] == 1 and state["failed"]

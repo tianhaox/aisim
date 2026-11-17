@@ -27,6 +27,7 @@ import fcntl
 import json
 import os
 import platform
+import resource
 import subprocess
 import sys
 import threading
@@ -59,9 +60,11 @@ SWEEP = Path(__file__).resolve().parents[1] / "cases" / "base_ops" / "glm53flash
 # the revision and the runner checks config.json and tokenizer.json either way.
 CHECKPOINT_ROOT_ENV = "GLM53_ATTN_CHECKPOINT_ROOT"
 RUNNER = "collector.vllm.glm53flash_attention_runner"
-# The output directory is archived every few minutes to a volume other jobs share, and the
-# runner's log has no size bound (a worker that fails in a loop writes gigabytes). A file of
-# an attempt past this size leaves the output directory; the measurements are a few MB a rank.
+# The output directory is archived every few minutes to a volume other jobs share. A vLLM
+# worker that dies on a CUDA error dumps core (17 GB a worker on GB200, into the working
+# directory), and the runner's log has no size bound. So the runner dumps no core and runs in
+# a directory beside the output, and a file past this size leaves the output directory; the
+# measurements are a few MB a rank.
 OVERSIZE_BYTES = 64 << 20
 PARK_TAIL_BYTES = 64 << 10
 
@@ -78,10 +81,18 @@ def checkpoint_root() -> Path:
     return Path(forced) if forced else _job_volume() / "glm53flash-checkpoints"
 
 
-def park_oversize(attempt: Path, parking: Path | None = None) -> list[dict]:
-    """Move every file of ``attempt`` larger than ``OVERSIZE_BYTES`` to ``parking`` and leave
-    ``<name>.parked`` (its size, where it went and its tail) in its place. A rename on the
-    job volume, so a process that has the file open keeps writing to it there."""
+def runner_cwd() -> Path:
+    """The runner's working directory: on the job volume, outside the archived output."""
+    cwd = _job_volume() / "glm53flash-oversize" / "cwd"
+    cwd.mkdir(parents=True, exist_ok=True)
+    return cwd
+
+
+def park_oversize(directory: Path, parking: Path | None = None) -> list[dict]:
+    """Move every file under ``directory`` larger than ``OVERSIZE_BYTES`` to ``parking`` and
+    leave ``<name>.parked`` (its size, where it went and its tail) in its place. A rename on
+    the job volume, so a process that has the file open keeps writing to it there."""
+    attempt = directory
     parking = parking or _job_volume() / "glm53flash-oversize" / attempt.name
     parked = []
     for path in sorted(p for p in attempt.rglob("*") if p.is_file() and not p.is_symlink()):
@@ -91,7 +102,7 @@ def park_oversize(attempt: Path, parking: Path | None = None) -> list[dict]:
         target = parking / path.relative_to(attempt)
         target.parent.mkdir(parents=True, exist_ok=True)
         with path.open("rb") as stream:
-            stream.seek(size - PARK_TAIL_BYTES)
+            stream.seek(max(0, size - PARK_TAIL_BYTES))
             tail = stream.read().decode(errors="replace")
         os.replace(path, target)
         note = {"file": str(path.relative_to(attempt)), "bytes": size, "moved_to": str(target)}
@@ -229,6 +240,7 @@ def run_attempt(
     plus the runner's exit code; a failing set leaves a partial attempt, it does not raise."""
     from collector.glm53flash_attention_launch import freeze
 
+    output = Path(output).resolve()
     attempt = output / name
     args = SimpleNamespace(
         backend="vllm",
@@ -278,22 +290,25 @@ def run_attempt(
 
     def keep_small() -> None:
         while not finished.wait(30):
-            park_oversize(attempt)
+            park_oversize(output)
 
+    # inherited by the runner and its workers; set here, not in a preexec hook, because the
+    # watcher thread is running when the runner is forked
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     watcher = threading.Thread(target=keep_small, daemon=True)
     watcher.start()
     try:
         with (attempt / "runner.log").open("w") as log:
             try:
                 code = subprocess.run(
-                    command, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout
+                    command, env=env, cwd=runner_cwd(), stdout=log, stderr=subprocess.STDOUT, timeout=timeout
                 ).returncode
             except subprocess.TimeoutExpired:
                 code = None
     finally:
         finished.set()
         watcher.join()
-        park_oversize(attempt)
+        park_oversize(output)
     if code != 0:
         # the runner names the failing set itself; when it dies earlier (engine start) or is
         # stopped, the set in flight is recorded here
