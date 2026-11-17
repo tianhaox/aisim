@@ -65,7 +65,7 @@ VLLM_ENV = {
 }
 # Multi-node NVLink (MNNVL) only where the NVLink domain spans nodes
 # (GB200/GB300 NVL72); HGX nodes are one NVLink domain each.
-VLLM_NVL72_ENV = {"NCCL_MNNVL_ENABLE": "1"}
+VLLM_NVL72_ENV = {"NCCL_MNNVL_ENABLE": "0"}  # scratch experiment: no IMEX channel in the job container
 # Checkpoint safetensors payload (zai-org/GLM-5.3-Flash@eb9eb208: 305.8 GiB;
 # nvidia/GLM-5.3-Flash-NVFP4@09b04e5e: 190.4 GiB). A deployment whose
 # per-rank weight share exceeds one GPU's memory cannot load (capacity fact);
