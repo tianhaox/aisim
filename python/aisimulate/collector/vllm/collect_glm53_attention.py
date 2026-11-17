@@ -204,9 +204,13 @@ def attempt_state(attempt: Path) -> dict:
 INTERRUPTED = "Interrupted"
 
 
-def close_attempt(attempt: Path, error_type: str, error: str) -> str | None:
+def close_attempt(attempt: Path, error_type: str, error: str, every_set: bool = False) -> str | None:
     """Name the set an attempt was measuring when it ended without a completion receipt and
-    without a failed set, so ``finalize --partial`` can admit what it finished. Returns the set."""
+    without a failed set, so ``finalize --partial`` can admit what it finished. Returns the set.
+
+    ``every_set`` names every selected set of an attempt that passed no target: its runner
+    ended before the first measurement (the engine did not start), which no set caused, so
+    the pass moves to the next utilization instead of spending one engine start per set."""
     state = attempt_state(attempt)
     if state["complete"] or state["failed"]:
         return None
@@ -215,10 +219,12 @@ def close_attempt(attempt: Path, error_type: str, error: str) -> str | None:
     in_flight = next((s for s in order if s not in state["done"]), None)
     if in_flight is None:
         return None
+    named = order if every_set and not state["targets_passed"] else [in_flight]
     (attempt / "raw").mkdir(exist_ok=True)
     with (attempt / "raw" / "progress.jsonl").open("a") as stream:
-        entry = {"set_id": in_flight, "status": "failed", "error_type": error_type, "error": error}
-        stream.write(json.dumps(entry) + "\n")
+        for set_id in named:
+            entry = {"set_id": set_id, "status": "failed", "error_type": error_type, "error": error}
+            stream.write(json.dumps(entry) + "\n")
     return in_flight
 
 
@@ -313,7 +319,10 @@ def run_attempt(
         # the runner names the failing set itself; when it dies earlier (engine start) or is
         # stopped, the set in flight is recorded here
         close_attempt(
-            attempt, "RunnerExit", f"the runner ended with exit code {code} before naming a set; see runner.log"
+            attempt,
+            "RunnerExit",
+            f"the runner ended with exit code {code} before naming a set; see runner.log",
+            every_set=True,
         )
     state = attempt_state(attempt)
     kept = sum(p.stat().st_size for p in attempt.rglob("*") if p.is_file())
