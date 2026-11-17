@@ -72,7 +72,7 @@ VLLM_NVL72_SERVING_ENV = {
     "NCCL_CUMEM_ENABLE": "1",
     "NCCL_NVLS_ENABLE": "1",
     "NCCL_P2P_LEVEL": "NVL",
-    "NCCL_MNNVL_ENABLE": "1",
+    "NCCL_MNNVL_ENABLE": "0",  # scratch experiment: no IMEX channel in the job container
     "VLLM_USE_NCCL_SYMM_MEM": "1",
 }
 NVL72_DEVICES = ("NVIDIA GB200", "NVIDIA GB300")
