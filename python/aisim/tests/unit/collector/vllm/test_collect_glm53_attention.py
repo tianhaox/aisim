@@ -183,3 +183,25 @@ def test_a_runner_that_dies_before_naming_a_set_counts_against_that_utilization(
     (attempt / "attempt_state.json").write_text("{}")
     remaining, failures = glm.open_sets(tmp_path, "nvfp4", 2, "regular")
     assert "decode-b3" in remaining and list(failures["decode-b3"]) == ["0.92"]
+
+
+def test_a_file_past_the_size_bound_leaves_the_archived_output(tmp_path, monkeypatch):
+    """The output directory is archived to a shared volume; an unbounded runner log must not
+    grow there. The writer keeps its file, and a note with the tail stays in its place."""
+    monkeypatch.setattr(glm, "OVERSIZE_BYTES", 1000)
+    monkeypatch.setattr(glm, "PARK_TAIL_BYTES", 10)
+    attempt = tmp_path / "out" / "nvfp4-tp2-regular-00-u85"
+    (attempt / "raw").mkdir(parents=True)
+    (attempt / "raw" / "rank-0.jsonl").write_text("x" * 900)
+    parking = tmp_path / "parking"
+    with (attempt / "runner.log").open("w") as log:
+        log.write("a" * 1500 + "the tail!!")
+        log.flush()
+        (parked,) = glm.park_oversize(attempt, parking)
+        log.write(" written after the move")
+    assert parked["file"] == "runner.log" and parked["bytes"] == 1510
+    assert not (attempt / "runner.log").exists() and (attempt / "raw" / "rank-0.jsonl").is_file()
+    assert (parking / "runner.log").read_text().endswith("the tail!! written after the move")
+    note = json.loads((attempt / "runner.log.parked").read_text())
+    assert note["tail"] == "the tail!!" and note["moved_to"] == str(parking / "runner.log")
+    assert glm.park_oversize(attempt, parking) == []
