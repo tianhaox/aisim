@@ -10,6 +10,7 @@ serving identity) and ``fetch=0`` (only report the checkpoint state).
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -41,6 +42,13 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     if args.get("fetch") == "0":
         return result
     _du("before", out_dir)
+
+    def report() -> None:
+        while True:
+            time.sleep(600)
+            _du("periodic", out_dir)
+
+    threading.Thread(target=report, daemon=True).start()
     if args.get("mode") == "deploy":
         # every open set of the class, in passes over the utilization ladder
         with glm.exclusive(Path(out_dir)):
