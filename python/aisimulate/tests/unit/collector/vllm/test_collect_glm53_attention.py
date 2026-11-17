@@ -223,11 +223,11 @@ def test_the_runner_dumps_no_core_and_runs_beside_the_output(tmp_path, monkeypat
 
     def fake_run(command, **kwargs):
         launches.append(kwargs)
-        (output / "core.VLLM::Worker_TP.1.2").write_bytes(b"x" * 2000)  # a core pattern that names a directory
+        (output / "core.VLLM::Worker_TP.1.2").write_bytes(b"x" * 200_000)  # a core pattern that names a directory
         return SimpleNamespace(returncode=1)
 
     monkeypatch.setattr(glm.subprocess, "run", fake_run)
-    monkeypatch.setattr(glm, "OVERSIZE_BYTES", 1000)
+    monkeypatch.setattr(glm, "OVERSIZE_BYTES", 100_000)  # above the manifest
     state = glm.run_attempt(
         output=output,
         name="nvfp4-tp2-regular-00-u85",
@@ -244,5 +244,7 @@ def test_the_runner_dumps_no_core_and_runs_beside_the_output(tmp_path, monkeypat
     (launch,) = launches
     assert output not in [launch["cwd"], *launch["cwd"].parents] and launch["cwd"].is_dir()
     assert not (output / "core.VLLM::Worker_TP.1.2").exists()
-    assert (tmp_path / "volume" / "glm53flash-oversize" / "shard" / "core.VLLM::Worker_TP.1.2").stat().st_size == 2000
+    assert (
+        tmp_path / "volume" / "glm53flash-oversize" / "shard" / "core.VLLM::Worker_TP.1.2"
+    ).stat().st_size == 200_000
     assert state["returncode"] == 1 and state["failed"]
