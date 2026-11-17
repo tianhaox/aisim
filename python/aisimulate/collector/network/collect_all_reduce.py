@@ -59,6 +59,40 @@ from helper import (
     xpu_graph_measure_enabled,
 )
 
+# vLLM's serving environment where the NVLink domain spans nodes (GB200 and GB300 NVL72), as
+# glm53flash_attention_launch exports it (VLLM_ENV and VLLM_NVL72_ENV): NVLink SHARP and
+# vLLM's NCCL symmetric memory. With VLLM_USE_NCCL_SYMM_MEM the communicator answers an
+# all-reduce from NCCL symmetric memory where it applies (vllm v0.32.0
+# cuda_communicator.py:428, symm_mem.py should_use_symm_mem) and bounds the custom
+# all-reduce by it (custom_all_reduce.py:243). On these systems the rows are about half the
+# default environment's (GB200, two GPUs: 3.8 vs 7.0 us at 128 bytes, 8.2 vs 24.5 us at
+# 1 MiB); on HGX systems the two environments measure the same. The benchmark exports it
+# itself, so the rows do not depend on the environment of the job that runs it.
+VLLM_NVL72_SERVING_ENV = {
+    "NCCL_CUMEM_ENABLE": "1",
+    "NCCL_NVLS_ENABLE": "1",
+    "NCCL_P2P_LEVEL": "NVL",
+    "NCCL_MNNVL_ENABLE": "1",
+    "VLLM_USE_NCCL_SYMM_MEM": "1",
+}
+NVL72_DEVICES = ("NVIDIA GB200", "NVIDIA GB300")
+
+
+def vllm_serving_env(device_name: str) -> dict[str, str]:
+    """The variables the vLLM all-reduce benchmark exports on ``device_name``."""
+    return dict(VLLM_NVL72_SERVING_ENV) if device_name in NVL72_DEVICES else {}
+
+
+def export_vllm_serving_env() -> dict[str, str]:
+    """Export ``vllm_serving_env`` of this node's GPU. Called before vLLM builds its groups:
+    NCCL reads its variables when a communicator is created and vLLM reads its switch when
+    the device communicator is built."""
+    if not torch.cuda.is_available():
+        return {}
+    env = vllm_serving_env(torch.cuda.get_device_name(0))
+    os.environ.update(env)
+    return env
+
 
 def _init_process_group_with_device_id(backend: str, init_method: str, world_size: int, rank: int, local_rank: int):
     """Pre-initialize torch.distributed with explicit device_id.
@@ -334,6 +368,9 @@ def benchmark_trtllm_allreduce(
 
 def setup_vllm_distributed(world_size, rank, use_slurm):
     """Setup vLLM distributed environment"""
+    serving_env = export_vllm_serving_env()
+    if serving_env and rank == 0:
+        print(f"vLLM serving environment: {serving_env}")
     try:
         from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
         from vllm.distributed.parallel_state import (
