@@ -10,6 +10,8 @@ serving identity) and ``fetch=0`` (only report the checkpoint state).
 from __future__ import annotations
 
 import json
+import os
+import platform
 import threading
 import time
 from pathlib import Path
@@ -23,7 +25,20 @@ def _du(label: str, out_dir: Path) -> None:
     print("GLM53_DU " + json.dumps({"at": label, "bytes": sum(s for s, _ in files), "top": top}), flush=True)
 
 
+def _node() -> None:
+    """Which node this is and whether it has IMEX channels: NCCL_MNNVL_ENABLE=1 (the NVL72
+    serving environment) fails communicator init on a node without a working channel."""
+    imex = Path("/dev/nvidia-caps-imex-channels")
+    report = {
+        "host": platform.node(),
+        "slurm": {k: v for k, v in os.environ.items() if k in ("SLURMD_NODENAME", "SLURM_JOB_NODELIST")},
+        "imex_channels": sorted(p.name for p in imex.iterdir()) if imex.is_dir() else None,
+    }
+    print("GLM53_NODE " + json.dumps(report), flush=True)
+
+
 def run(args: dict[str, str], out_dir: Path) -> dict:
+    _node()
     from collector.helper import get_sm_version
     from collector.vllm import collect_glm53_attention as glm
 
