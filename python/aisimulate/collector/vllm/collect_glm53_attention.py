@@ -29,6 +29,7 @@ import os
 import platform
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,16 +59,46 @@ SWEEP = Path(__file__).resolve().parents[1] / "cases" / "base_ops" / "glm53flash
 # the revision and the runner checks config.json and tokenizer.json either way.
 CHECKPOINT_ROOT_ENV = "GLM53_ATTN_CHECKPOINT_ROOT"
 RUNNER = "collector.vllm.glm53flash_attention_runner"
+# The output directory is archived every few minutes to a volume other jobs share, and the
+# runner's log has no size bound (a worker that fails in a loop writes gigabytes). A file of
+# an attempt past this size leaves the output directory; the measurements are a few MB a rank.
+OVERSIZE_BYTES = 64 << 20
+PARK_TAIL_BYTES = 64 << 10
+
+
+def _job_volume() -> Path:
+    # /dev/shm is host memory under the pipeline's --ipc=host; the job volume is the only
+    # disk a collection job owns besides the result directory, which is archived.
+    volume = Path("/mnt/ci_job")
+    return volume if volume.is_dir() else Path.home()
 
 
 def checkpoint_root() -> Path:
     forced = os.environ.get(CHECKPOINT_ROOT_ENV)
-    if forced:
-        return Path(forced)
-    # /dev/shm is host memory under the pipeline's --ipc=host; the job volume is the only
-    # disk a collection job owns besides the result directory, which is archived.
-    volume = Path("/mnt/ci_job")
-    return (volume if volume.is_dir() else Path.home()) / "glm53flash-checkpoints"
+    return Path(forced) if forced else _job_volume() / "glm53flash-checkpoints"
+
+
+def park_oversize(attempt: Path, parking: Path | None = None) -> list[dict]:
+    """Move every file of ``attempt`` larger than ``OVERSIZE_BYTES`` to ``parking`` and leave
+    ``<name>.parked`` (its size, where it went and its tail) in its place. A rename on the
+    job volume, so a process that has the file open keeps writing to it there."""
+    parking = parking or _job_volume() / "glm53flash-oversize" / attempt.name
+    parked = []
+    for path in sorted(p for p in attempt.rglob("*") if p.is_file() and not p.is_symlink()):
+        size = path.stat().st_size
+        if size <= OVERSIZE_BYTES:
+            continue
+        target = parking / path.relative_to(attempt)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("rb") as stream:
+            stream.seek(size - PARK_TAIL_BYTES)
+            tail = stream.read().decode(errors="replace")
+        os.replace(path, target)
+        note = {"file": str(path.relative_to(attempt)), "bytes": size, "moved_to": str(target)}
+        path.with_name(path.name + ".parked").write_text(json.dumps({**note, "tail": tail}, indent=1))
+        print("GLM53_OVERSIZE " + json.dumps(note), flush=True)
+        parked.append(note)
+    return parked
 
 
 def _config_ok(path: Path, checkpoint: str) -> bool:
@@ -243,11 +274,26 @@ def run_attempt(
         str(utilization),
     ]
     started = time.time()
-    with (attempt / "runner.log").open("w") as log:
-        try:
-            code = subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout).returncode
-        except subprocess.TimeoutExpired:
-            code = None
+    finished = threading.Event()
+
+    def keep_small() -> None:
+        while not finished.wait(30):
+            park_oversize(attempt)
+
+    watcher = threading.Thread(target=keep_small, daemon=True)
+    watcher.start()
+    try:
+        with (attempt / "runner.log").open("w") as log:
+            try:
+                code = subprocess.run(
+                    command, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout
+                ).returncode
+            except subprocess.TimeoutExpired:
+                code = None
+    finally:
+        finished.set()
+        watcher.join()
+        park_oversize(attempt)
     if code != 0:
         # the runner names the failing set itself; when it dies earlier (engine start) or is
         # stopped, the set in flight is recorded here
@@ -255,7 +301,8 @@ def run_attempt(
             attempt, "RunnerExit", f"the runner ended with exit code {code} before naming a set; see runner.log"
         )
     state = attempt_state(attempt)
-    state.update(returncode=code, seconds=round(time.time() - started, 1))
+    kept = sum(p.stat().st_size for p in attempt.rglob("*") if p.is_file())
+    state.update(returncode=code, seconds=round(time.time() - started, 1), output_bytes=kept)
     (attempt / "attempt_state.json").write_text(json.dumps(state, indent=1))
     return state
 

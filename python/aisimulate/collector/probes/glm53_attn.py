@@ -14,6 +14,14 @@ import time
 from pathlib import Path
 
 
+def _du(label: str, out_dir: Path) -> None:
+    """What the archived result directory holds (the pipeline snapshots it to a small volume)."""
+    root = Path(out_dir).parent
+    files = [(p.stat().st_size, str(p.relative_to(root))) for p in root.rglob("*") if p.is_file()]
+    top = sorted(files, reverse=True)[:6]
+    print("GLM53_DU " + json.dumps({"at": label, "bytes": sum(s for s, _ in files), "top": top}), flush=True)
+
+
 def run(args: dict[str, str], out_dir: Path) -> dict:
     from collector.helper import get_sm_version
     from collector.vllm import collect_glm53_attention as glm
@@ -32,6 +40,7 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     print("GLM53_FETCH " + json.dumps(result), flush=True)
     if args.get("fetch") == "0":
         return result
+    _du("before", out_dir)
     if args.get("mode") == "deploy":
         # every open set of the class, in passes over the utilization ladder
         with glm.exclusive(Path(out_dir)):
@@ -45,6 +54,7 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
                 model_path=model_path,
             )
         result["deployment"] = summary
+        _du("after-deployment", out_dir)
         result["failed"] = bool(summary["open_sets"])
         print("GLM53_DEPLOY_BEGIN " + json.dumps(result, default=str) + " GLM53_DEPLOY_END", flush=True)
         return result
