@@ -121,8 +121,10 @@ exported serving environment.
 
 `--system` selects the system YAML: its `num_gpus_per_node` sets
 `--gres=gpu:N` (override with `--gpus-per-node`). The vLLM environment keeps
-`NCCL_NVLS_ENABLE` and `VLLM_USE_NCCL_SYMM_MEM` on every system and exports
-`NCCL_MNNVL_ENABLE` only when `num_gpus_per_rack` spans several nodes.
+`NCCL_NVLS_ENABLE` and `VLLM_USE_NCCL_SYMM_MEM` on every system. Where
+`num_gpus_per_rack` spans several nodes (GB200/GB300 NVL72) it also exports
+`NCCL_MNNVL_ENABLE=0`: an attempt is one node, and with multi-node NVLink on
+NCCL fails communicator init in a container without an IMEX channel.
 
 ```bash
 python -m collector.glm53flash_attention_launch --backend vllm --checkpoint nvfp4 --tp 1 \

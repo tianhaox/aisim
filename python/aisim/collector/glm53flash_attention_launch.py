@@ -63,9 +63,14 @@ VLLM_ENV = {
     "NCCL_P2P_LEVEL": "NVL",
     "VLLM_USE_NCCL_SYMM_MEM": "1",
 }
-# Multi-node NVLink (MNNVL) only where the NVLink domain spans nodes
-# (GB200/GB300 NVL72); HGX nodes are one NVLink domain each.
-VLLM_NVL72_ENV = {"NCCL_MNNVL_ENABLE": "1"}
+# GB200/GB300 NVL72, where the NVLink domain spans nodes: NCCL's multi-node
+# NVLink (MNNVL) is switched off. Every attempt is one node, and with it on
+# NCCL fails communicator init in a container that has no IMEX channel ("MNNVL
+# ... is available but not working on this system"), which is how collection
+# jobs start. GB300 NVFP4 TP2 measured this way is within 2% of the 0.31.0
+# table, which was collected with MNNVL on. HGX nodes are one NVLink domain
+# each and leave the variable unset.
+VLLM_NVL72_ENV = {"NCCL_MNNVL_ENABLE": "0"}
 # Checkpoint safetensors payload (zai-org/GLM-5.3-Flash@eb9eb208: 305.8 GiB;
 # nvidia/GLM-5.3-Flash-NVFP4@09b04e5e: 190.4 GiB). A deployment whose
 # per-rank weight share exceeds one GPU's memory cannot load (capacity fact);
@@ -171,8 +176,7 @@ def freeze(args) -> tuple[Path, dict, dict]:
         "runtime_arch": args.arch,
         "system": args.system,
         "gpus_per_node": args.gpus_per_node,
-        # Exported framework environment (MNNVL excluded on single-node
-        # NVLink domains).
+        # Exported framework environment (NCCL_MNNVL_ENABLE only on NVL72).
         "serving_env": env_serving,
         "layer_id": sweep["layer_id"],
         "sweep": sweep,
