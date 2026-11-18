@@ -205,3 +205,59 @@ def test_a_file_past_the_size_bound_leaves_the_archived_output(tmp_path, monkeyp
     note = json.loads((attempt / "runner.log.parked").read_text())
     assert note["tail"] == "the tail!!" and note["moved_to"] == str(parking / "runner.log")
     assert glm.park_oversize(attempt, parking) == []
+
+
+def test_the_runner_dumps_no_core_and_stray_dumps_leave_the_output(tmp_path, monkeypatch):
+    """A worker that dies on a CUDA error dumps its address space into the working directory;
+    in the archived output that is tens of GB a crash."""
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_bytes(NVFP4_CONFIG.read_bytes())
+    output = tmp_path / "result" / "shard"
+    output.mkdir(parents=True)
+    monkeypatch.setattr(glm, "_job_volume", lambda: tmp_path / "volume")
+    limits = []
+    monkeypatch.setattr(glm.resource, "setrlimit", lambda what, value: limits.append((what, value)))
+
+    def fake_run(command, **kwargs):
+        (output / "core.VLLM::Worker_TP.1.2").write_bytes(b"x" * 200_000)  # a core pattern that names a directory
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(glm.subprocess, "run", fake_run)
+    monkeypatch.setattr(glm, "OVERSIZE_BYTES", 100_000)  # above the manifest
+    state = glm.run_attempt(
+        output=output,
+        name="nvfp4-tp2-regular-00-u85",
+        system="b300_sxm",
+        checkpoint="nvfp4",
+        tp_size=2,
+        kv_cache_dtype="fp8",
+        context_class="regular",
+        only_sets=["decode-b3"],
+        utilization=0.85,
+        model_path=model,
+    )
+    assert limits == [(glm.resource.RLIMIT_CORE, (0, 0))]
+    assert not (output / "core.VLLM::Worker_TP.1.2").exists()
+    assert (
+        tmp_path / "volume" / "glm53flash-oversize" / "shard" / "core.VLLM::Worker_TP.1.2"
+    ).stat().st_size == 200_000
+    assert state["returncode"] == 1 and state["failed"]
+
+
+def test_an_engine_that_does_not_start_counts_against_every_set_of_the_pass(tmp_path):
+    """No target passed and no set named: the failure is the engine's, so the pass moves to the
+    next utilization once instead of spending one engine start per open set."""
+    attempt = _freeze(tmp_path, "nvfp4-tp2-regular-00-u70", ["decode-b3", "decode-b6"], 0.7)
+    glm.close_attempt(attempt, "RunnerExit", "exit code 1", every_set=True)
+    (attempt / "attempt_state.json").write_text("{}")
+    remaining, failures = glm.open_sets(tmp_path, "nvfp4", 2, "regular")
+    assert {"decode-b3", "decode-b6"} <= set(remaining)
+    assert list(failures["decode-b3"]) == ["0.7"] and list(failures["decode-b6"]) == ["0.7"]
+
+
+def test_a_runner_that_dies_after_measuring_names_the_set_in_flight_only(tmp_path):
+    attempt = _freeze(tmp_path, "nvfp4-tp2-regular-00-u85", ["decode-b3", "decode-b6"], 0.85)
+    _record(attempt, ["decode-b3"])
+    assert glm.close_attempt(attempt, "RunnerExit", "exit code 1", every_set=True) == "decode-b6"
+    assert glm.attempt_state(attempt)["failed"].keys() == {"decode-b6"}

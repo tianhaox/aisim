@@ -27,6 +27,7 @@ import fcntl
 import json
 import os
 import platform
+import resource
 import subprocess
 import sys
 import threading
@@ -59,9 +60,10 @@ SWEEP = Path(__file__).resolve().parents[1] / "cases" / "base_ops" / "glm53flash
 # the revision and the runner checks config.json and tokenizer.json either way.
 CHECKPOINT_ROOT_ENV = "GLM53_ATTN_CHECKPOINT_ROOT"
 RUNNER = "collector.vllm.glm53flash_attention_runner"
-# The output directory is archived every few minutes to a volume other jobs share, and the
-# runner's log has no size bound (a worker that fails in a loop writes gigabytes). A file of
-# an attempt past this size leaves the output directory; the measurements are a few MB a rank.
+# The output directory is archived every few minutes to a volume other jobs share. A vLLM
+# worker that dies on a CUDA error dumps core (17 GB a worker on GB200, into the working
+# directory), and the runner's log has no size bound. So the runner dumps no core, and a file
+# past this size leaves the output directory; the measurements are a few MB a rank.
 OVERSIZE_BYTES = 64 << 20
 PARK_TAIL_BYTES = 64 << 10
 
@@ -78,10 +80,11 @@ def checkpoint_root() -> Path:
     return Path(forced) if forced else _job_volume() / "glm53flash-checkpoints"
 
 
-def park_oversize(attempt: Path, parking: Path | None = None) -> list[dict]:
-    """Move every file of ``attempt`` larger than ``OVERSIZE_BYTES`` to ``parking`` and leave
-    ``<name>.parked`` (its size, where it went and its tail) in its place. A rename on the
-    job volume, so a process that has the file open keeps writing to it there."""
+def park_oversize(directory: Path, parking: Path | None = None) -> list[dict]:
+    """Move every file under ``directory`` larger than ``OVERSIZE_BYTES`` to ``parking`` and
+    leave ``<name>.parked`` (its size, where it went and its tail) in its place. A rename on
+    the job volume, so a process that has the file open keeps writing to it there."""
+    attempt = directory
     parking = parking or _job_volume() / "glm53flash-oversize" / attempt.name
     parked = []
     for path in sorted(p for p in attempt.rglob("*") if p.is_file() and not p.is_symlink()):
@@ -91,7 +94,7 @@ def park_oversize(attempt: Path, parking: Path | None = None) -> list[dict]:
         target = parking / path.relative_to(attempt)
         target.parent.mkdir(parents=True, exist_ok=True)
         with path.open("rb") as stream:
-            stream.seek(size - PARK_TAIL_BYTES)
+            stream.seek(max(0, size - PARK_TAIL_BYTES))
             tail = stream.read().decode(errors="replace")
         os.replace(path, target)
         note = {"file": str(path.relative_to(attempt)), "bytes": size, "moved_to": str(target)}
@@ -193,9 +196,13 @@ def attempt_state(attempt: Path) -> dict:
 INTERRUPTED = "Interrupted"
 
 
-def close_attempt(attempt: Path, error_type: str, error: str) -> str | None:
+def close_attempt(attempt: Path, error_type: str, error: str, every_set: bool = False) -> str | None:
     """Name the set an attempt was measuring when it ended without a completion receipt and
-    without a failed set, so ``finalize --partial`` can admit what it finished. Returns the set."""
+    without a failed set, so ``finalize --partial`` can admit what it finished. Returns the set.
+
+    ``every_set`` names every selected set of an attempt that passed no target: its runner
+    ended before the first measurement (the engine did not start), which no set caused, so
+    the pass moves to the next utilization instead of spending one engine start per set."""
     state = attempt_state(attempt)
     if state["complete"] or state["failed"]:
         return None
@@ -204,10 +211,12 @@ def close_attempt(attempt: Path, error_type: str, error: str) -> str | None:
     in_flight = next((s for s in order if s not in state["done"]), None)
     if in_flight is None:
         return None
+    named = order if every_set and not state["targets_passed"] else [in_flight]
     (attempt / "raw").mkdir(exist_ok=True)
     with (attempt / "raw" / "progress.jsonl").open("a") as stream:
-        entry = {"set_id": in_flight, "status": "failed", "error_type": error_type, "error": error}
-        stream.write(json.dumps(entry) + "\n")
+        for set_id in named:
+            entry = {"set_id": set_id, "status": "failed", "error_type": error_type, "error": error}
+            stream.write(json.dumps(entry) + "\n")
     return in_flight
 
 
@@ -229,6 +238,7 @@ def run_attempt(
     plus the runner's exit code; a failing set leaves a partial attempt, it does not raise."""
     from collector.glm53flash_attention_launch import freeze
 
+    output = Path(output).resolve()
     attempt = output / name
     args = SimpleNamespace(
         backend="vllm",
@@ -278,8 +288,11 @@ def run_attempt(
 
     def keep_small() -> None:
         while not finished.wait(30):
-            park_oversize(attempt)
+            park_oversize(output)
 
+    # inherited by the runner and its workers; set here, not in a preexec hook, because the
+    # watcher thread is running when the runner is forked
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     watcher = threading.Thread(target=keep_small, daemon=True)
     watcher.start()
     try:
@@ -293,12 +306,15 @@ def run_attempt(
     finally:
         finished.set()
         watcher.join()
-        park_oversize(attempt)
+        park_oversize(output)
     if code != 0:
         # the runner names the failing set itself; when it dies earlier (engine start) or is
         # stopped, the set in flight is recorded here
         close_attempt(
-            attempt, "RunnerExit", f"the runner ended with exit code {code} before naming a set; see runner.log"
+            attempt,
+            "RunnerExit",
+            f"the runner ended with exit code {code} before naming a set; see runner.log",
+            every_set=True,
         )
     state = attempt_state(attempt)
     kept = sum(p.stat().st_size for p in attempt.rglob("*") if p.is_file())
