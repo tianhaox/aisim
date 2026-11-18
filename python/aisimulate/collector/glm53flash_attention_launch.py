@@ -57,11 +57,13 @@ VLLM_PREFILL_GRAPH_CAPTURE_SIZES = (
 )
 # vLLM serving environment on every system: NVLink SHARP and vLLM's NCCL
 # symmetric memory stay on for HGX (H100/H200/B300) as on GB300.
+# SCRATCH EXPERIMENT: NVLink SHARP and NCCL symmetric memory off (H200 nodes whose NCCL
+# fails "Failed to bind NVLink SHARP (NVLS)"); the attention rows exclude the all-reduce.
 VLLM_ENV = {
     "NCCL_CUMEM_ENABLE": "1",
-    "NCCL_NVLS_ENABLE": "1",
+    "NCCL_NVLS_ENABLE": "0",
     "NCCL_P2P_LEVEL": "NVL",
-    "VLLM_USE_NCCL_SYMM_MEM": "1",
+    "VLLM_USE_NCCL_SYMM_MEM": "0",
 }
 # Multi-node NVLink (MNNVL) only where the NVLink domain spans nodes
 # (GB200/GB300 NVL72); HGX nodes are one NVLink domain each.
