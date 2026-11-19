@@ -267,6 +267,7 @@ def main():
     max_model_len = selected_max_model_len(manifest)
     if manifest["max_model_len"] != max_model_len:
         raise ValueError("manifest max_model_len differs from its selected context class")
+    single_rank = os.environ.get("GLM53_ATTN_SINGLE_RANK") == "1"
     engine_args = {
         "model": options.model_path,
         "tensor_parallel_size": expected["tp_size"],
@@ -278,7 +279,9 @@ def main():
         "enable_prefix_caching": False,
         "async_scheduling": False,
         "language_model_only": True,
-        "distributed_executor_backend": "mp",
+        # GLM53_ATTN_SINGLE_RANK=1: only rank 0 of the deployment, in this process, on one GPU
+        # (glm53flash_attention_worker.emulate_rank0).
+        "distributed_executor_backend": "uni" if single_rank else "mp",
         "gpu_memory_utilization": options.gpu_memory_utilization,
         "compilation_config": compilation_config,
         "disable_log_stats": True,
@@ -304,7 +307,7 @@ def main():
         provenance,
         {"warmup": plan["warmup"], "iterations": plan["iterations"]},
     )
-    if sorted(r["rank"] for r in setup) != list(range(expected["tp_size"])):
+    if sorted(r["rank"] for r in setup) != ([0] if single_rank else list(range(expected["tp_size"]))):
         raise RuntimeError(f"unexpected worker ranks {setup}")
 
     def progress(payload):

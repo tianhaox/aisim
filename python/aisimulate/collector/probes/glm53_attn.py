@@ -42,6 +42,9 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     from collector.helper import get_sm_version
     from collector.vllm import collect_glm53_attention as glm
 
+    if args.get("rank0") == "1":
+        # one GPU: rank 0 of the TP deployment alone (worker.emulate_rank0)
+        os.environ["GLM53_ATTN_SINGLE_RANK"] = "1"
     checkpoint = args["checkpoint"]
     tp_size = int(args["tp"])
     context_class = args.get("cls", "regular")
@@ -82,6 +85,8 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
         print("GLM53_DEPLOY_BEGIN " + json.dumps(result, default=str) + " GLM53_DEPLOY_END", flush=True)
         return result
     name = f"{checkpoint}-tp{tp_size}-{context_class}-probe-u{int(float(args.get('util', '0.85')) * 100)}"
+    if args.get("rank0") == "1":
+        name += "-rank0"
     with glm.exclusive(Path(out_dir)):
         state = glm.run_attempt(
             output=Path(out_dir),
@@ -99,6 +104,18 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     attempt = Path(out_dir) / name
     log = (attempt / "runner.log").read_text(errors="replace")
     result["runner_log_tail"] = log[-6000:]
+    if args.get("rank0") == "1":
+        # per-target median of rank 0's measured repetitions (the contract needs every rank)
+        import statistics
+        from collections import defaultdict
+
+        samples = defaultdict(list)
+        raw = attempt / "raw" / "rank-0.jsonl"
+        for line in raw.read_text().splitlines() if raw.exists() else []:
+            record = json.loads(line)
+            samples[record["target_id"]].append(record)
+        result["rank0_targets"] = len(samples)
+        result["rank0_record_keys"] = sorted(next(iter(samples.values()))[0]) if samples else []
     try:
         from collector.glm53flash_attention_contract import load_attempt, write_parquet
 

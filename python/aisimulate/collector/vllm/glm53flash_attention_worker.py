@@ -60,6 +60,8 @@ def register() -> None:
     """
     if not os.environ.get("GLM53_ATTN_MANIFEST"):
         return
+    if os.environ.get("GLM53_ATTN_SINGLE_RANK") == "1":
+        emulate_rank0()
     from vllm.v1.worker.gpu import model_runner as runner_module
 
     runner_class = runner_module.GPUModelRunner
@@ -75,6 +77,44 @@ def register() -> None:
 
     runner_class.capture_model = capture_model
     runner_class._glm53_attn_patched = True
+
+
+def emulate_rank0() -> None:
+    """Build rank 0 of the manifest's TP deployment alone, in this process, on one GPU.
+
+    The engine keeps the deployment's ``tensor_parallel_size`` (every shard shape, state shape and
+    weight slice is rank 0's), but the process group has this process only and the TP group's
+    collectives are local: all-reduce returns its input, all-gather repeats it. The values in the
+    residual stream are therefore not the deployment's; the kernels, their shapes and the
+    KV/IndexPool layout are. vLLM's own torchrun mode runs one such engine per rank
+    (v1/executor/uniproc_executor.py ExecutorWithExternalLauncher).
+    """
+    from vllm.v1.worker import gpu_worker
+
+    if getattr(gpu_worker, "_glm53_rank0", False):
+        return
+    init_environment = gpu_worker.init_distributed_environment
+    ensure = gpu_worker.ensure_model_parallel_initialized
+
+    def init_distributed_environment(world_size, rank, *args, **kwargs):
+        return init_environment(1, 0, *args, **kwargs)
+
+    def ensure_model_parallel_initialized(tp_size, *args, **kwargs):
+        import torch
+        from vllm.distributed import parallel_state
+
+        ensure(1, *args, **kwargs)
+        group = parallel_state.get_tp_group()
+        group.world_size = tp_size
+        group.ranks = list(range(tp_size))
+        group.all_reduce = lambda input_: input_
+        group.all_gather = lambda input_, dim=-1: torch.cat([input_] * tp_size, dim=dim)
+        group.reduce_scatter = lambda input_, dim=-1: input_.chunk(tp_size, dim=dim)[0]
+        print(f"GLM53_RANK0 tp group emulated: world_size={group.world_size} rank={group.rank_in_group}", flush=True)
+
+    gpu_worker.init_distributed_environment = init_distributed_environment
+    gpu_worker.ensure_model_parallel_initialized = ensure_model_parallel_initialized
+    gpu_worker._glm53_rank0 = True
 
 
 def _layer(model_runner, layer_id: int):
