@@ -194,6 +194,45 @@ class Trace:
         print("GLM53_RANK0_TRACE " + json.dumps(report), flush=True)
 
 
+def synthetic_inputs(torch, model_runner, probe) -> None:
+    """Scratch: every sparse-MLA layer's attention input becomes a function of the token position.
+
+    One rank alone cannot produce the deployment's residual stream (each layer's output is a sum
+    over ranks), and what it produces instead turns non-finite in the KDA layers below the
+    measured one. The sparse-MLA layers therefore take seeded random Fourier features of the
+    position (distinct per token, bounded, no ties) instead of the residual stream: their index
+    scores, top-k selection, latent KV and IndexPool state are then written by the engine's own
+    path from finite, non-degenerate values, with rank 0's real weights.
+    """
+    features = {}
+
+    def synth(hidden_states, positions):
+        if not features:
+            # built at the first call (the framework's first capture), then constants of every graph
+            generator = torch.Generator(device="cpu").manual_seed(5300)
+            hidden = hidden_states.shape[-1]
+            features["freq"] = (1.0 + 2.0 * torch.rand(hidden, generator=generator)).to(hidden_states.device)
+            features["phase"] = (6.283185307179586 * torch.rand(hidden, generator=generator)).to(hidden_states.device)
+        angle = positions.to(torch.float32).reshape(-1, 1) * features["freq"] + features["phase"]
+        return (torch.sin(angle) * 0.03).to(hidden_states.dtype)
+
+    count = 0
+    for module in model_runner.model.modules():
+        if type(module).__name__ != "Glm5NextMLAAttention":
+            continue
+        count += 1
+        if module is probe.attention:
+            probe.synth = synth
+            continue
+        forward = module.forward
+
+        def replaced(hidden_states, positions, _forward=forward):
+            return _forward(synth(hidden_states, positions), positions)
+
+        module.forward = replaced
+    print(f"GLM53_RANK0 position-derived attention inputs on {count} sparse-MLA layers", flush=True)
+
+
 def _layer(model_runner, layer_id: int):
     for module in model_runner.model.modules():
         if type(module).__name__ == "Glm5NextDecoderLayer" and module.layer_idx == layer_id:
@@ -210,6 +249,8 @@ def install_probe(model_runner) -> None:
     validate_attention(attention, manifest, model_runner)
     if STATE.probe is None:
         STATE.probe = Probe(torch, attention, model_runner, manifest)
+        if os.environ.get("GLM53_ATTN_RANK0_INPUT") == "position":
+            synthetic_inputs(torch, model_runner, STATE.probe)
         STATE.trace = None
         if os.environ.get("GLM53_ATTN_RANK0_TRACE") == "1":
             STATE.trace = Trace(torch, model_runner, manifest["layer_id"])
@@ -302,6 +343,7 @@ class Probe:
         self.keepalive = None
         self.pool = None
         self.source = kernel_source(attention)
+        self.synth = None
         attention.forward = self.forward
 
     def forward(self, hidden_states, positions):
@@ -309,6 +351,8 @@ class Probe:
         from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
         from vllm.forward_context import get_forward_context, is_forward_context_available
 
+        if self.synth is not None:
+            hidden_states = self.synth(hidden_states, positions)
         if BreakableCUDAGraphCapture.current() is not None and is_forward_context_available():
             # Framework PIECEWISE (breakable) capture of one token size.
             self.pw_captured[int(hidden_states.shape[0])] = SimpleNamespace(
