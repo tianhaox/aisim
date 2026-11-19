@@ -231,6 +231,21 @@ def synthetic_inputs(torch, model_runner, probe) -> None:
 
         module.forward = replaced
     print(f"GLM53_RANK0 position-derived attention inputs on {count} sparse-MLA layers", flush=True)
+    if os.environ.get("GLM53_ATTN_RANK0_KDA") == "off":
+        # The KDA layers' recurrent state is where the single-rank run first turns non-finite
+        # (their inputs are finite), and NaN then reaches every MoE router above. They are not the
+        # measured operator (KDA has its own table): they add nothing to the residual stream here.
+        skipped = 0
+        for module in model_runner.model.modules():
+            if type(module).__name__ == "Glm5NextLinearAttention":
+                skipped += 1
+
+                def no_update(*args, **kwargs):
+                    hidden_states = kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
+                    return torch.zeros_like(hidden_states)
+
+                module.forward = no_update
+        print(f"GLM53_RANK0 {skipped} KDA layers add nothing to the residual stream", flush=True)
 
 
 def _layer(model_runner, layer_id: int):

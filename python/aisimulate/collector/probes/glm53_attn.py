@@ -49,6 +49,8 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     if args.get("scale"):
         os.environ["GLM53_ATTN_RANK0_SCALE"] = args["scale"]
+    if args.get("kda"):
+        os.environ["GLM53_ATTN_RANK0_KDA"] = args["kda"]
     if args.get("input"):
         os.environ["GLM53_ATTN_RANK0_INPUT"] = args["input"]
     if args.get("trace") == "1":
