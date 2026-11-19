@@ -107,7 +107,14 @@ def emulate_rank0() -> None:
         group = parallel_state.get_tp_group()
         group.world_size = tp_size
         group.ranks = list(range(tp_size))
-        group.all_reduce = lambda input_: input_
+        # A partial sum stands for every rank's (rank 0's times the group size) so the residual
+        # stream keeps the deployment's scale; with the identity it lost three quarters of every
+        # layer's update at TP4 and the KV state went non-finite within 512 tokens. The embedding
+        # is not a partial sum: one rank holds a token's row and the others add zeros.
+        group.all_reduce = lambda input_: input_ * tp_size
+        from vllm.model_executor.layers import vocab_parallel_embedding
+
+        vocab_parallel_embedding.tensor_model_parallel_all_reduce = lambda input_: input_
         group.all_gather = lambda input_, dim=-1: torch.cat([input_] * tp_size, dim=dim)
         group.reduce_scatter = lambda input_, dim=-1: input_.chunk(tp_size, dim=dim)[0]
         print(f"GLM53_RANK0 tp group emulated: world_size={group.world_size} rank={group.rank_in_group}", flush=True)
