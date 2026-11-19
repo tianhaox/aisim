@@ -47,6 +47,10 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
         os.environ["GLM53_ATTN_SINGLE_RANK"] = "1"
     if args.get("blocking") == "1":
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    if args.get("scale"):
+        os.environ["GLM53_ATTN_RANK0_SCALE"] = args["scale"]
+    if args.get("trace") == "1":
+        os.environ["GLM53_ATTN_RANK0_TRACE"] = "1"
     checkpoint = args["checkpoint"]
     tp_size = int(args["tp"])
     context_class = args.get("cls", "regular")
@@ -88,7 +92,7 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
         return result
     name = f"{checkpoint}-tp{tp_size}-{context_class}-probe-u{int(float(args.get('util', '0.85')) * 100)}"
     if args.get("rank0") == "1":
-        name += "-rank0"
+        name += "-rank0" + (f"-s{args['scale']}" if args.get("scale") else "")
     with glm.exclusive(Path(out_dir)):
         state = glm.run_attempt(
             output=Path(out_dir),

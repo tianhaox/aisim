@@ -107,11 +107,12 @@ def emulate_rank0() -> None:
         group = parallel_state.get_tp_group()
         group.world_size = tp_size
         group.ranks = list(range(tp_size))
-        # A partial sum stands for every rank's (rank 0's times the group size) so the residual
-        # stream keeps the deployment's scale; with the identity it lost three quarters of every
-        # layer's update at TP4 and the KV state went non-finite within 512 tokens. The embedding
-        # is not a partial sum: one rank holds a token's row and the others add zeros.
-        group.all_reduce = lambda input_: input_ * tp_size
+        # Rank 0's partial sum times GLM53_ATTN_RANK0_SCALE stands for the sum over ranks (1 = the
+        # partial sum itself). The embedding is not a partial sum: one rank holds a token's row and
+        # the others add zeros.
+        scale = float(os.environ.get("GLM53_ATTN_RANK0_SCALE", "1"))
+        group.all_reduce = (lambda input_: input_) if scale == 1.0 else (lambda input_: input_ * scale)
+        print(f"GLM53_RANK0 all-reduce scale {scale}", flush=True)
         from vllm.model_executor.layers import vocab_parallel_embedding
 
         vocab_parallel_embedding.tensor_model_parallel_all_reduce = lambda input_: input_
@@ -122,6 +123,75 @@ def emulate_rank0() -> None:
     gpu_worker.init_distributed_environment = init_distributed_environment
     gpu_worker.ensure_model_parallel_initialized = ensure_model_parallel_initialized
     gpu_worker._glm53_rank0 = True
+
+
+class Trace:
+    """Scratch diagnostic: the largest magnitude every module of the first layers produced.
+
+    The hooks write into two GPU buffers with tensor operations, so they are captured into the
+    framework's CUDA graphs and keep updating on every replay: ``last`` is the latest forward's
+    peak |output| per module (NaN when the output has one), ``bad`` stays 1 once a module produced
+    a non-finite value.
+    """
+
+    def __init__(self, torch, model_runner, last_layer: int):
+        self.torch = torch
+        self.names = []
+        modules = []
+        for name, module in model_runner.model.named_modules():
+            kind = type(module).__name__
+            if kind == "VocabParallelEmbedding":
+                modules.append((name, module))
+            if kind == "Glm5NextDecoderLayer" and module.layer_idx <= last_layer:
+                modules.append((name, module))
+                for child, sub in module.named_children():
+                    modules.append((f"{name}.{child}", sub))
+                    if child == "self_attn":
+                        modules.extend((f"{name}.{child}.{n}", m) for n, m in sub.named_children())
+        device = next(model_runner.model.parameters()).device
+        self.last = torch.zeros(len(modules), dtype=torch.float32, device=device)
+        self.bad = torch.zeros(len(modules), dtype=torch.float32, device=device)
+        for index, (name, module) in enumerate(modules):
+            self.names.append(f"{name}<{type(module).__name__}>")
+            module.register_forward_hook(self._hook(index))
+        print(f"GLM53_RANK0_TRACE hooks on {len(modules)} modules", flush=True)
+
+    def _hook(self, index: int):
+        torch = self.torch
+
+        def hook(module, args, output):
+            items = output if isinstance(output, (tuple, list)) else (output,)
+            # amax/amin propagate NaN and need no full-size temporary inside the graph
+            peaks = [
+                torch.maximum(t.detach().amax(), -t.detach().amin()).float()
+                for t in items
+                if torch.is_tensor(t) and t.is_floating_point() and t.numel() > 0
+            ]
+            if not peaks:
+                return
+            peak = torch.stack(peaks).amax()
+            self.last[index] = peak
+            self.bad[index] = torch.maximum(self.bad[index], (~torch.isfinite(peak)).float())
+
+        return hook
+
+    def dump(self, target_id: str, tensors: dict) -> None:
+        torch = self.torch
+        torch.cuda.synchronize()
+        last, bad = self.last.tolist(), self.bad.tolist()
+        report = {
+            "target": target_id,
+            "tensors": {
+                name: [
+                    bool(torch.isfinite(t).all().item()),
+                    float(torch.nan_to_num(t.float(), nan=0.0, posinf=0.0, neginf=0.0).abs().amax().item()),
+                    int((t.float().abs().amax(dim=-1) == 0).sum().item()),
+                ]
+                for name, t in tensors.items()
+            },
+            "modules": [[name, last[i], int(bad[i])] for i, name in enumerate(self.names)],
+        }
+        print("GLM53_RANK0_TRACE " + json.dumps(report), flush=True)
 
 
 def _layer(model_runner, layer_id: int):
@@ -140,6 +210,9 @@ def install_probe(model_runner) -> None:
     validate_attention(attention, manifest, model_runner)
     if STATE.probe is None:
         STATE.probe = Probe(torch, attention, model_runner, manifest)
+        STATE.trace = None
+        if os.environ.get("GLM53_ATTN_RANK0_TRACE") == "1":
+            STATE.trace = Trace(torch, model_runner, manifest["layer_id"])
         manager = model_runner.cudagraph_manager
         replay = manager.run_fullgraph
 
@@ -284,6 +357,8 @@ class Probe:
             o_proj.reduce_results = reduce
         latencies = time_replays(torch, graph.replay, options["warmup"], options["iterations"])
         finite = bool(torch.isfinite(output[:batch]).all().item())
+        if getattr(STATE, "trace", None) is not None:
+            STATE.trace.dump(target["target_id"], {"input": record.hidden_states[:batch], "output": output[:batch]})
         STATE.writer.samples(target, latencies, options["warmup"], self.source, {"finite": finite})
         del graph
         if not finite:
@@ -328,6 +403,8 @@ def _measure_prefill(probe, target: dict, replays_before: int) -> dict:
     finally:
         o_proj.reduce_results = reduce
     finite = bool(torch.isfinite(output[:tokens]).all().item())
+    if getattr(STATE, "trace", None) is not None:
+        STATE.trace.dump(target["target_id"], {"input": record.hidden_states[:tokens], "output": output[:tokens]})
     STATE.writer.samples(target, latencies, options["warmup"], probe.source, {"finite": finite})
     probe.keepalive = capture
     del capture, output
