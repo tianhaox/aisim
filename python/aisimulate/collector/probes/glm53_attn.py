@@ -37,6 +37,30 @@ def _node() -> None:
     print("GLM53_NODE " + json.dumps(report), flush=True)
 
 
+def _fetch_meta(glm, checkpoint: str) -> tuple[Path, dict]:
+    """The checkpoint's config and tokenizer files only: the dummy model loads no weights."""
+    full = glm.checkpoint_root() / checkpoint
+    if glm._config_ok(full, checkpoint) and (full / "tokenizer.json").is_file():
+        return full, {"reused": True, "meta_only": False}
+    from huggingface_hub import snapshot_download
+
+    model_id, revision = glm.CHECKPOINTS[checkpoint]
+    path = glm.checkpoint_root() / f"{checkpoint}-meta"
+    reused = glm._config_ok(path, checkpoint) and (path / "tokenizer.json").is_file()
+    if not reused:
+        path.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            local_dir=str(path),
+            allow_patterns=["*.json", "*.jinja", "*.txt", "*.model"],
+            max_workers=8,
+        )
+    if not glm._config_ok(path, checkpoint):
+        raise RuntimeError(f"{path} does not hold config.json of {model_id}@{revision[:8]}")
+    return path, {"reused": reused, "meta_only": True}
+
+
 def run(args: dict[str, str], out_dir: Path) -> dict:
     _node()
     from collector.helper import get_sm_version
@@ -45,6 +69,9 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     if args.get("rank0") == "1":
         # one GPU: rank 0 of the TP deployment alone (worker.emulate_rank0)
         os.environ["GLM53_ATTN_SINGLE_RANK"] = "1"
+    if args.get("dummy") == "1":
+        # one GPU: random weights, the TP shard as a logical slice (runner.dummy_model_dir)
+        os.environ["GLM53_ATTN_DUMMY"] = "1"
     if args.get("blocking") == "1":
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     if args.get("scale"):
@@ -64,7 +91,10 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     kv = args.get("kv") or glm.serving_kv_cache_dtype(sm_version)
     result: dict = {"system": system, "gpus": gpus, "sm": sm_version, "kv_cache_dtype": kv}
     started = time.time()
-    model_path, fetched = glm.fetch_checkpoint(checkpoint)
+    if args.get("dummy") == "1":
+        model_path, fetched = _fetch_meta(glm, checkpoint)
+    else:
+        model_path, fetched = glm.fetch_checkpoint(checkpoint)
     result["checkpoint"] = {**fetched, "path": str(model_path), "wall_seconds": round(time.time() - started, 1)}
     print("GLM53_FETCH " + json.dumps(result), flush=True)
     if args.get("fetch") == "0":
@@ -95,9 +125,9 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
         print("GLM53_DEPLOY_BEGIN " + json.dumps(result, default=str) + " GLM53_DEPLOY_END", flush=True)
         return result
     name = f"{checkpoint}-tp{tp_size}-{context_class}-probe-u{int(float(args.get('util', '0.85')) * 100)}"
-    if args.get("rank0") == "1":
+    if args.get("rank0") == "1" or args.get("dummy") == "1":
         name += (
-            "-rank0"
+            ("-rank0" if args.get("rank0") == "1" else "-dummy")
             + (f"-s{args['scale']}" if args.get("scale") else "")
             + (f"-{args['input']}" if args.get("input") else "")
         )
@@ -118,7 +148,7 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     attempt = Path(out_dir) / name
     log = (attempt / "runner.log").read_text(errors="replace")
     result["runner_log_tail"] = log[-6000:]
-    if args.get("rank0") == "1":
+    if args.get("rank0") == "1" or args.get("dummy") == "1":
         # per-target median of rank 0's measured repetitions (the contract needs every rank)
         import statistics
         from collections import defaultdict

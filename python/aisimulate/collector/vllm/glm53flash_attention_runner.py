@@ -73,6 +73,50 @@ def write_plugin(directory: Path) -> Path:
     return directory
 
 
+def dummy_model_dir(model_path: Path, config: dict, tp_size: int, layer_id: int) -> Path:
+    """Scratch: a model directory for the layers up to the measured one, sized as one rank.
+
+    ``GLM53_ATTN_DUMMY=1`` runs the collection the way the single-module collectors do: no
+    checkpoint weights (vLLM's ``load_format="dummy"`` random values), the TP shard as a logical
+    slice (``num_attention_heads / tp`` on a TP1 engine) and one GPU. The engine still builds the
+    KV/IndexPool state, the metadata and the serving CUDA graphs. Only the layers up to the
+    measured one are built, unquantized (the MLA projections are BF16 in every checkpoint).
+    """
+    import tempfile
+
+    text = dict(config.get("text_config", config))
+    layers = layer_id + 1
+    for name in ("num_attention_heads", "num_key_value_heads"):
+        if name in text:
+            text[name] //= tp_size
+    text["num_hidden_layers"] = layers
+    for name in ("layer_types", "mlp_layer_types", "indexer_types"):
+        if isinstance(text.get(name), list):
+            text[name] = text[name][:layers]
+    linear = dict(text["linear_attn_config"])
+    for name in ("kda_layers", "full_attn_layers"):
+        linear[name] = [layer for layer in linear[name] if layer < layers]
+    text["linear_attn_config"] = linear
+    patched = {name: value for name, value in config.items() if name != "quantization_config"}
+    if "text_config" in config:
+        patched["text_config"] = text
+    else:
+        patched = {name: value for name, value in text.items() if name != "quantization_config"}
+    directory = Path(tempfile.mkdtemp(prefix="glm53-dummy-"))
+    for entry in model_path.iterdir():
+        weights = entry.suffix in (".safetensors", ".bin", ".pt", ".pth")
+        if entry.name == "config.json" or entry.name.startswith(".") or weights or entry.is_dir():
+            continue
+        (directory / entry.name).symlink_to(entry.resolve())
+    (directory / "config.json").write_text(json.dumps(patched))
+    print(
+        f"GLM53_DUMMY model dir {directory}: {layers} layers, {text['num_attention_heads']} heads, "
+        f"files {sorted(p.name for p in directory.iterdir())}",
+        flush=True,
+    )
+    return directory
+
+
 class KpoolAlignmentError(RuntimeError):
     """A vLLM prefill chunk would start off the IndexPool grid (stock 0.32.0 defect)."""
 
@@ -269,9 +313,13 @@ def main():
     if manifest["max_model_len"] != max_model_len:
         raise ValueError("manifest max_model_len differs from its selected context class")
     single_rank = os.environ.get("GLM53_ATTN_SINGLE_RANK") == "1"
+    dummy = os.environ.get("GLM53_ATTN_DUMMY") == "1"
+    engine_model = options.model_path
+    if dummy:
+        engine_model = str(dummy_model_dir(Path(options.model_path), config, expected["tp_size"], manifest["layer_id"]))
     engine_args = {
-        "model": options.model_path,
-        "tensor_parallel_size": expected["tp_size"],
+        "model": engine_model,
+        "tensor_parallel_size": 1 if dummy else expected["tp_size"],
         "kv_cache_dtype": SERVING_KV_CACHE_DTYPE[expected["kv_cache_dtype"]],
         # Serving context limit of the selected context class (capacity only).
         "max_model_len": max_model_len,
@@ -282,12 +330,14 @@ def main():
         "language_model_only": True,
         # GLM53_ATTN_SINGLE_RANK=1: only rank 0 of the deployment, in this process, on one GPU
         # (glm53flash_attention_worker.emulate_rank0).
-        "distributed_executor_backend": "uni" if single_rank else "mp",
+        "distributed_executor_backend": "uni" if single_rank or dummy else "mp",
         "gpu_memory_utilization": options.gpu_memory_utilization,
         "compilation_config": compilation_config,
         "disable_log_stats": True,
         "seed": 0,
     }
+    if dummy:
+        engine_args["load_format"] = "dummy"
     llm = LLM(**engine_args)
     source_sha, _ = package_source_sha256(Path(vllm.__file__).resolve().parent)
     provenance = {
@@ -312,7 +362,7 @@ def main():
         provenance,
         {"warmup": plan["warmup"], "iterations": plan["iterations"]},
     )
-    if sorted(r["rank"] for r in setup) != ([0] if single_rank else list(range(expected["tp_size"]))):
+    if sorted(r["rank"] for r in setup) != ([0] if single_rank or dummy else list(range(expected["tp_size"]))):
         raise RuntimeError(f"unexpected worker ranks {setup}")
 
     def progress(payload):
