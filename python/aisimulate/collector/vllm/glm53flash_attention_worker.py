@@ -62,6 +62,8 @@ def register() -> None:
         return
     if os.environ.get("GLM53_ATTN_SINGLE_RANK") == "1":
         emulate_rank0()
+    if os.environ.get("GLM53_ATTN_DUMMY_INIT") == "std":
+        standard_init()
     from vllm.v1.worker.gpu import model_runner as runner_module
 
     runner_class = runner_module.GPUModelRunner
@@ -77,6 +79,61 @@ def register() -> None:
 
     runner_class.capture_model = capture_model
     runner_class._glm53_attn_patched = True
+
+
+def standard_init() -> None:
+    """Scratch: dummy weights at the usual initialisation scale (GLM53_ATTN_DUMMY_INIT=std).
+
+    vLLM's dummy loader draws every tensor from U(-1e-3, 1e-3), norm weights included, and with
+    those weights the prefill targets that score the index ran 1.2-2.1x the real checkpoint's
+    time (decode matched). ``top_k_per_row_prefill`` (csrc/sampler.cu) selects by a histogram
+    over the scores' half-precision bit pattern (extractBinIdx step 0) and takes further passes
+    when the threshold bin holds too many of them; scores far below half precision's range would
+    all land in one bin. That cause is inferred from the source, not measured. Here matrices are
+    N(0, 0.02) (the checkpoint's ``initializer_range``), norm weights 1 and biases 0, before the
+    loader's ``process_weights_after_loading``.
+    """
+    from vllm.model_executor.model_loader import dummy_loader
+
+    loader = dummy_loader.DummyModelLoader
+    if getattr(loader, "_glm53_std", False):
+        return
+    load_weights = loader.load_weights
+
+    def patched(self, model, model_config):
+        import torch
+
+        load_weights(self, model, model_config)
+        generators = {}
+        counts = {"normal": 0, "ones": 0, "zeros": 0, "kept": 0}
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                leaf = name.rsplit(".", 1)[-1]
+                if not torch.is_floating_point(param) or param.device.type == "meta":
+                    counts["kept"] += 1
+                elif leaf == "bias":
+                    param.zero_()
+                    counts["zeros"] += 1
+                elif param.dim() == 1 and leaf == "weight":
+                    param.fill_(1.0)
+                    counts["ones"] += 1
+                elif param.dim() >= 2:
+                    if param.device not in generators:
+                        generators[param.device] = torch.Generator(device=param.device).manual_seed(5301)
+                    flat = param.view(-1)
+                    for start in range(0, flat.numel(), 1 << 24):
+                        end = min(start + (1 << 24), flat.numel())
+                        values = torch.randn(
+                            end - start, generator=generators[param.device], device=param.device, dtype=torch.float32
+                        )
+                        flat[start:end].copy_(values * 0.02)
+                    counts["normal"] += 1
+                else:
+                    counts["kept"] += 1
+        print(f"GLM53_DUMMY standard init {counts}", flush=True)
+
+    loader.load_weights = patched
+    loader._glm53_std = True
 
 
 def emulate_rank0() -> None:

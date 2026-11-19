@@ -72,6 +72,8 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     if args.get("dummy") == "1":
         # one GPU: random weights, the TP shard as a logical slice (runner.dummy_model_dir)
         os.environ["GLM53_ATTN_DUMMY"] = "1"
+    if args.get("init"):
+        os.environ["GLM53_ATTN_DUMMY_INIT"] = args["init"]
     if args.get("blocking") == "1":
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     if args.get("scale"):
@@ -128,6 +130,7 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     if args.get("rank0") == "1" or args.get("dummy") == "1":
         name += (
             ("-rank0" if args.get("rank0") == "1" else "-dummy")
+            + (f"-{args['init']}" if args.get("init") else "")
             + (f"-s{args['scale']}" if args.get("scale") else "")
             + (f"-{args['input']}" if args.get("input") else "")
         )
