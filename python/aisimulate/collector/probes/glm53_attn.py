@@ -45,6 +45,8 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     if args.get("rank0") == "1":
         # one GPU: rank 0 of the TP deployment alone (worker.emulate_rank0)
         os.environ["GLM53_ATTN_SINGLE_RANK"] = "1"
+    if args.get("blocking") == "1":
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     checkpoint = args["checkpoint"]
     tp_size = int(args["tp"])
     context_class = args.get("cls", "regular")

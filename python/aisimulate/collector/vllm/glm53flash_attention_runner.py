@@ -78,7 +78,8 @@ class KpoolAlignmentError(RuntimeError):
 
 
 class Driver:
-    def __init__(self, llm, plan, tokens, output):
+    def __init__(self, llm, plan, tokens, output, vocab_shard=None):
+        self.vocab_shard = vocab_shard
         self.llm = llm
         self.engine = llm.llm_engine
         self.scheduler = self.engine.engine_core.engine_core.scheduler
@@ -118,11 +119,11 @@ class Driver:
 
         params = SamplingParams(max_tokens=max_tokens, temperature=0.0, ignore_eos=True, detokenize=False)
         for request in range(batch):
-            self.engine.add_request(
-                f"{prefix}-{request:02d}",
-                {"prompt_token_ids": request_tokens(self.tokens, request, length)},
-                params,
-            )
+            ids = request_tokens(self.tokens, request, length)
+            if self.vocab_shard:
+                # single rank: only rank 0's vocabulary shard has embedding rows in this process
+                ids = [token % self.vocab_shard for token in ids]
+            self.engine.add_request(f"{prefix}-{request:02d}", {"prompt_token_ids": ids}, params)
 
     def _seed(self, prefix, batch, chunk, start, end):
         computed = start
@@ -299,7 +300,11 @@ def main():
     }
     tokenizer = llm.get_tokenizer()
     tokens, _ = manifest_tokens(manifest, tokenizer, Path(options.model_path))
-    driver = Driver(llm, plan, tokens, output)
+    vocab_shard = None
+    if single_rank:
+        vocab_shard = int(config.get("text_config", config)["vocab_size"]) // expected["tp_size"]
+        print(f"GLM53_RANK0 token ids mapped below {vocab_shard}", flush=True)
+    driver = Driver(llm, plan, tokens, output, vocab_shard)
     setup = driver.rpc(
         "rpc_setup",
         str(output),
